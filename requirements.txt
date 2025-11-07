@@ -1,0 +1,4 @@
+Flask
+pycomm3
+asyncua
+pytest

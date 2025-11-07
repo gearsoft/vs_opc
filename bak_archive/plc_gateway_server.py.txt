@@ -1,0 +1,450 @@
+# --- 1. Python Gateway Server (Requires: asyncua, pycomm3, Flask, asyncio) ---
+import asyncio
+import time
+import os
+from collections import deque
+import sys
+import logging
+# Prefer asyncua for async OPC UA server; if your editor flags unresolved import,
+# you can ignore the linter here — at runtime ensure 'asyncua' is installed.
+try:
+    from asyncua import Server, ua  # type: ignore
+except Exception:
+    # If asyncua is missing, allow running in MOCK mode for tests without
+    # bringing the full dependency. When GATEWAY_MOCK_PLC is set we provide
+    # a small synchronous async-compatible stub that implements the subset
+    # of the asyncua API used by this module (Server, ua.VariantType, and
+    # variable objects with async write_value). This keeps tests lightweight
+    # and avoids requiring a network-capable OPC UA stack in CI/local dev.
+    if os.getenv("GATEWAY_MOCK_PLC", "0") in ("1", "true", "True"):
+        logging.info("asyncua not installed; using lightweight MOCK Server stubs for tests")
+        from types import SimpleNamespace
+
+        class _DummyVar:
+            def __init__(self, value=None):
+                self._value = value
+
+            async def write_value(self, value):
+                # accept writes from the poller; noop for tests
+                self._value = value
+
+        class _DummyFolder:
+            async def add_variable(self, idx, name, value, vartype=None):
+                return _DummyVar(value)
+
+        class _DummyObjects:
+            async def add_folder(self, idx, name):
+                return _DummyFolder()
+
+        class _DummyNodes:
+            def __init__(self):
+                self.objects = _DummyObjects()
+
+        class Server:
+            def __init__(self):
+                self.nodes = _DummyNodes()
+                self._stop_event = asyncio.Event()
+
+            async def init(self):
+                return None
+
+            def set_endpoint(self, ep):
+                return None
+
+            async def register_namespace(self, uri):
+                # return a pseudo-namespace index
+                return 1
+
+            async def start(self):
+                # keep running until stop() is called or task is cancelled
+                await self._stop_event.wait()
+
+            async def stop(self):
+                # signal the start() coroutine to exit
+                try:
+                    self._stop_event.set()
+                except Exception:
+                    pass
+
+        class ua:
+            class VariantType:
+                Boolean = 1
+                Double = 2
+                Int64 = 3
+    else:
+        # Provide a clearer runtime error if asyncua is missing and we're not
+        # in MOCK mode where stubs are acceptable.
+        raise ImportError("The 'asyncua' package is required; install with: pip install asyncua")
+from flask import Flask, jsonify, request
+import threading
+import json
+import urllib.request
+import urllib.error
+
+# --- Structured logging setup ---
+logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
+logger = logging.getLogger(__name__)
+
+# --- Optional Prometheus metrics (non-fatal if package missing) ---
+LAST_BACKOFF_GAUGE = None
+FAIL_COUNT_GAUGE = None
+POLL_LATENCY_HISTOGRAM = None
+RECONNECT_COUNTER = None
+CONNECTED_GAUGE = None
+RECENT_ERRORS_COUNT = None
+RECENT_ERROR_LAST_TS = None
+RECENT_ERROR_CODE_GAUGE = None
+try:
+    # try to import the prometheus client objects we'll use
+    from prometheus_client import Gauge, Histogram, Counter, start_http_server  # type: ignore
+    # label gauges/counters by PLC logical name and IP for richer dashboards
+    LAST_BACKOFF_GAUGE = Gauge('vs_opc_plc_last_backoff_seconds', 'Last backoff delay seconds', ['plc', 'ip'])
+    FAIL_COUNT_GAUGE = Gauge('vs_opc_plc_fail_count', 'Current PLC fail count', ['plc', 'ip'])
+    # Histogram for poll cycle latency (seconds)
+    POLL_LATENCY_HISTOGRAM = Histogram('vs_opc_poll_latency_seconds', 'PLC poll loop latency seconds')
+    RECONNECT_COUNTER = Counter('vs_opc_plc_reconnect_total', 'Total reconnect attempts', ['plc', 'ip'])
+    CONNECTED_GAUGE = Gauge('vs_opc_plc_connected', 'PLC connected boolean (1/0)', ['plc', 'ip'])
+    # Recent errors metrics: count and last-seen timestamp. We also expose
+    # the last error message as a labeled gauge (value 1) so dashboards can
+    # show the most-recent message via its label. Be aware that exposing
+    # arbitrary error messages as label values can increase cardinality.
+    RECENT_ERRORS_COUNT = Gauge('vs_opc_plc_recent_errors_count', 'Number of recent errors stored', ['plc', 'ip'])
+    RECENT_ERROR_LAST_TS = Gauge('vs_opc_plc_recent_error_timestamp_seconds', 'Timestamp of most recent error', ['plc', 'ip'])
+    # Normalized error code (low-cardinality) exposed as a label so dashboards
+    # can show the last error category without high cardinality messages.
+    RECENT_ERROR_CODE_GAUGE = Gauge('vs_opc_plc_recent_error_code', 'Normalized recent error code (value 1)', ['plc', 'ip', 'code'])
+except Exception:
+    # prometheus_client not installed — metrics will be a no-op
+    LAST_BACKOFF_GAUGE = None
+    FAIL_COUNT_GAUGE = None
+    POLL_LATENCY_HISTOGRAM = None
+    RECONNECT_COUNTER = None
+    CONNECTED_GAUGE = None
+    RECENT_ERRORS_COUNT = None
+    RECENT_ERROR_LAST_TS = None
+    RECENT_ERROR_CODE_GAUGE = None
+
+# Loki push URL for sending textual recent_errors to Loki (optional).
+LOKI_PUSH_URL = os.getenv('LOKI_PUSH_URL')
+
+
+def _send_to_loki(payload: dict) -> None:
+    """Send payload to Loki push API. Uses urllib to avoid adding requests dependency.
+
+    Payload should be the dict to POST to /loki/api/v1/push
+    """
+    if not LOKI_PUSH_URL:
+        return
+    data = json.dumps(payload).encode('utf-8')
+    req = urllib.request.Request(LOKI_PUSH_URL, data=data, headers={'Content-Type': 'application/json'})
+    try:
+        with urllib.request.urlopen(req, timeout=5) as resp:
+            # ignore response body
+            _ = resp.read()
+    except Exception:
+        logger.exception("Failed to push logs to Loki at %s", LOKI_PUSH_URL)
+
+
+def normalize_error_code(msg: str) -> str:
+    """Return a normalized, low-cardinality error code for a given message."""
+    if not msg:
+        return 'UNKNOWN'
+    m = msg.lower()
+    if 'forced reconnect' in m or 'forced reconnect failure' in m:
+        return 'FORCED_RECONNECT'
+    if 'recreate error' in m:
+        return 'RECREATE_ERROR'
+    if 'not connected' in m:
+        return 'NOT_CONNECTED'
+    if 'timeout' in m or 'timed out' in m:
+        return 'TIMEOUT'
+    if 'socket' in m or 'socket_timeout' in m:
+        return 'SOCKET_ERROR'
+    return 'OTHER'
+
+# Optional auto-start Prometheus HTTP server when env var METRICS_PORT or
+# PROMETHEUS_PORT is provided. This is opt-in and non-fatal if prometheus
+# client is absent or the port cannot be started.
+PROMETHEUS_PORT = os.getenv('METRICS_PORT') or os.getenv('PROMETHEUS_PORT')
+if PROMETHEUS_PORT and LAST_BACKOFF_GAUGE is not None:
+    try:
+        start_http_server(int(PROMETHEUS_PORT))
+        logger.info("Prometheus HTTP metrics server started on port %s", PROMETHEUS_PORT)
+    except Exception:
+        logger.exception("Failed to start Prometheus HTTP server on port %s", PROMETHEUS_PORT)
+
+# --- ** IMPORT PYCOMM3 DRIVERS ** ---
+# The drivers are imported directly from pycomm3
+try:
+    from pycomm3 import LogixDriver, SLCDriver  # type: ignore
+except Exception:
+    # If pycomm3 is missing but we're running in MOCK mode, provide lightweight
+    # dummy driver classes so tests can exercise the control flow without the
+    # external dependency. Otherwise, raise an informative ImportError.
+    if os.getenv("GATEWAY_MOCK_PLC", "0") in ("1", "true", "True"):
+        class LogixDriver:
+            def __init__(self, ip):
+                self._ip = ip
+                self.connected = False
+                self._cfg = {}
+            def open(self):
+                self.connected = True
+            def close(self):
+                self.connected = False
+            def read(self, *args, **kwargs):
+                raise RuntimeError("Dummy LogixDriver read called in MOCK mode")
+
+        class SLCDriver:
+            def __init__(self, ip):
+                self._ip = ip
+                self.connected = False
+                self._cfg = {}
+            def open(self):
+                self.connected = True
+            def close(self):
+                self.connected = False
+            def read(self, *args, **kwargs):
+                raise RuntimeError("Dummy SLCDriver read called in MOCK mode")
+    else:
+        raise ImportError("The 'pycomm3' package is required; install with: pip install pycomm3")
+# ------------------------------------
+
+# --- 1a. PLC Connection Config & Data Structure ---
+
+# ** REPLACE THESE WITH YOUR ACTUAL PLC IP ADDRESSES AND TAGS **
+COMPACTLOGIX_IP = '192.168.32.201' # MCP5: CompactLogix L35E
+SLC500_IP = '192.168.32.146'       # Mogul1 Depositor SLC 5/05
+
+# Data structure to hold the latest tag values
+plc_data = {
+    "ABS1_Auto": False, # CompactLogix Tag (e.g., MainProgram.Motor_Run)
+    "ABS1_CFA_Actual": 150.0,    # CompactLogix Tag (e.g., MainProgram.Setpoint_Speed)
+    "M1_Batch_Weight": 0       # SLC Tag (e.g., N7:0)
+}
+
+# Timestamp of the last successful PLC read (seconds since epoch)
+# --- 1b. PLC Reading/Writing Functions ---
+#
+# (existing functions below)
+plc_last_update = 0
+
+# Globals to allow graceful shutdown from the Flask thread
+opcua_server = None
+opcua_loop = None
+opcua_tasks = []
+
+# Event used to signal threads/worker functions to stop cooperatively
+shutdown_event = threading.Event()
+
+# Per-PLC health/status info
+plc_health = {
+    "compactlogix": {"ok": False, "last_success": 0, "last_error": None, "fail_count": 0, "recent_errors": deque(maxlen=10), "next_attempt": 0},
+    "slc500": {"ok": False, "last_success": 0, "last_error": None, "fail_count": 0, "recent_errors": deque(maxlen=10), "next_attempt": 0},
+}
+
+# Readiness flag and optional readiness file path. Tests can poll
+# `/api/v1/hmi/ready` or check for the file to know when initialization
+# and prepopulation is complete.
+server_ready = False
+READY_FILE = os.getenv('READY_FILE')
+
+# Poll period (seconds), configurable via env var POLL_PERIOD
+try:
+    POLL_PERIOD = float(os.getenv("POLL_PERIOD", "1.0"))
+except Exception:
+    POLL_PERIOD = 1.0
+
+# Reconnect/backoff settings
+RECONNECT_BASE = float(os.getenv("RECONNECT_BASE", "1.0"))
+RECONNECT_MAX = float(os.getenv("RECONNECT_MAX", "60.0"))
+# Socket/read timeout for pycomm3 drivers (seconds)
+PLC_SOCKET_TIMEOUT = float(os.getenv("PLC_SOCKET_TIMEOUT", "2.0"))
+
+# Shutdown timeout for staged shutdown (seconds)
+SHUTDOWN_TIMEOUT = float(os.getenv("SHUTDOWN_TIMEOUT", "5.0"))
+
+
+def compute_backoff_delay(fail_count: int) -> float:
+    """Return exponential backoff delay (seconds) based on fail_count."""
+    if fail_count <= 0:
+        return 0.0
+    return min(RECONNECT_BASE * (2 ** max(0, fail_count - 1)), RECONNECT_MAX)
+
+
+def try_reconnect_helper(driver, driver_cls, ip, key):
+    """Top-level reconnect helper extracted for testability.
+
+    Attempts to ensure the driver is connected. On failures, updates
+    plc_health with fail_count, next_attempt, and last_backoff.
+    Returns the driver (or a recreated driver) to use for subsequent reads.
+    """
+    try:
+        now = time.time()
+        if now < plc_health[key].get("next_attempt", 0):
+            return driver
+        # Testing hook: when running tests we may want to force the
+        # reconnect branch to record a failure/backoff even in mock
+        # mode. Only inject a synthetic failure when we do NOT have a
+        # driver object at all (driver is None). Previously we also
+        # injected when driver.connected was False which could cause
+        # repeated synthetic failures while mock drivers exist and
+        # prevent the first real poll from completing — blocking
+        # readiness in tests. Restricting to `driver is None` keeps the
+        # behavior useful for reconnect-path tests without interfering
+        # with normal mock driver polling.
+        # If tests request a forced reconnect/backoff, only inject a
+        # synthetic failure when we're NOT running in MOCK PLC mode.
+        # In MOCK mode the server pre-populates failures in the mock
+        # setup (see run_opcua_server) — injecting here caused repeated
+        # synthetic failures while mock drivers existed and prevented
+        # the poller from completing the first successful read used to
+        # signal readiness in tests.
+        if (os.getenv("GATEWAY_MOCK_FAIL_RECONNECT", "0") in ("1", "true", "True")
+            and driver is None
+            and os.getenv("GATEWAY_MOCK_PLC", "0") not in ("1", "true", "True")):
+            plc_health[key]["recent_errors"].append((time.time(), "forced reconnect failure (test)"))
+            plc_health[key]["fail_count"] += 1
+            # update recent-errors metrics (count + last-ts + normalized code)
+            try:
+                if RECENT_ERRORS_COUNT is not None:
+                    RECENT_ERRORS_COUNT.labels(plc=key, ip=ip).set(len(plc_health[key]["recent_errors"]))
+            except Exception:
+                pass
+            try:
+                if RECENT_ERROR_LAST_TS is not None:
+                    RECENT_ERROR_LAST_TS.labels(plc=key, ip=ip).set(float(plc_health[key]["recent_errors"][-1][0]))
+            except Exception:
+                pass
+            try:
+                if RECENT_ERROR_CODE_GAUGE is not None:
+                    code = normalize_error_code(plc_health[key]["recent_errors"][-1][1])
+                    RECENT_ERROR_CODE_GAUGE.labels(plc=key, ip=ip, code=code).set(1)
+            except Exception:
+                pass
+            # send textual message to Loki (best-effort)
+            try:
+                if LOKI_PUSH_URL:
+                    ts, msg = plc_health[key]["recent_errors"][-1]
+                    payload = {"streams": [{"stream": {"plc": key, "ip": ip}, "values": [[str(int(ts * 1e9)), msg]]}]}
+                    _send_to_loki(payload)
+            except Exception:
+                pass
+            fc = plc_health[key]["fail_count"]
+            delay = compute_backoff_delay(fc)
+            plc_health[key]["next_attempt"] = time.time() + delay
+            plc_health[key]["last_backoff"] = float(delay)
+            logger.info("(test) Backoff for %s: fail_count=%d, delay=%.2fs, next_attempt=%s", key, fc, delay, plc_health[key]["next_attempt"]) 
+            try:
+                if LAST_BACKOFF_GAUGE is not None:
+                    LAST_BACKOFF_GAUGE.labels(plc=key, ip=ip).set(delay)
+            except Exception:
+                pass
+            try:
+                if FAIL_COUNT_GAUGE is not None:
+                    FAIL_COUNT_GAUGE.labels(plc=key, ip=ip).set(fc)
+            except Exception:
+                pass
+            try:
+                if RECONNECT_COUNTER is not None:
+                    RECONNECT_COUNTER.labels(plc=key, ip=ip).inc()
+            except Exception:
+                pass
+        if getattr(driver, "connected", False):
+            plc_health[key]["fail_count"] = 0
+            plc_health[key]["next_attempt"] = 0
+            try:
+                if CONNECTED_GAUGE is not None:
+                    CONNECTED_GAUGE.labels(plc=key, ip=ip).set(1)
+            except Exception:
+                pass
+            try:
+                if FAIL_COUNT_GAUGE is not None:
+                    FAIL_COUNT_GAUGE.labels(plc=key, ip=ip).set(0)
+            except Exception:
+                pass
+            return driver
+        # attempt open() if provided
+        if hasattr(driver, "open"):
+            try:
+                try:
+                    driver._cfg["socket_timeout"] = PLC_SOCKET_TIMEOUT
+                    driver._cfg["timeout"] = max(driver._cfg.get("timeout", 1), PLC_SOCKET_TIMEOUT)
+                except Exception:
+                    pass
+                driver.open()
+            except Exception:
+                pass
+            if getattr(driver, "connected", False):
+                plc_health[key]["fail_count"] = 0
+                plc_health[key]["next_attempt"] = 0
+                try:
+                    if CONNECTED_GAUGE is not None:
+                        CONNECTED_GAUGE.labels(plc=key, ip=ip).set(1)
+                except Exception:
+                    pass
+                try:
+                    if FAIL_COUNT_GAUGE is not None:
+                        FAIL_COUNT_GAUGE.labels(plc=key, ip=ip).set(0)
+                except Exception:
+                    pass
+                return driver
+        # attempt to recreate
+        try:
+            newdrv = driver_cls(ip)
+            try:
+                newdrv._cfg["socket_timeout"] = PLC_SOCKET_TIMEOUT
+                newdrv._cfg["timeout"] = max(newdrv._cfg.get("timeout", 1), PLC_SOCKET_TIMEOUT)
+            except Exception:
+                pass
+            if hasattr(newdrv, "open"):
+                try:
+                    newdrv.open()
+                except Exception:
+                    pass
+            if getattr(newdrv, "connected", False):
+                plc_health[key]["fail_count"] = 0
+                plc_health[key]["next_attempt"] = 0
+                try:
+                    if CONNECTED_GAUGE is not None:
+                        CONNECTED_GAUGE.labels(plc=key, ip=ip).set(1)
+                except Exception:
+                    pass
+                try:
+                    if FAIL_COUNT_GAUGE is not None:
+                        FAIL_COUNT_GAUGE.labels(plc=key, ip=ip).set(0)
+                except Exception:
+                    pass
+            return newdrv
+        except Exception as e:
+            plc_health[key]["recent_errors"].append((time.time(), f"recreate error: {e}"))
+            plc_health[key]["fail_count"] += 1
+            # update recent-errors metrics (count + last-ts + normalized code)
+            try:
+                if RECENT_ERRORS_COUNT is not None:
+                    RECENT_ERRORS_COUNT.labels(plc=key, ip=ip).set(len(plc_health[key]["recent_errors"]))
+            except Exception:
+                pass
+            try:
+                if RECENT_ERROR_LAST_TS is not None:
+                    RECENT_ERROR_LAST_TS.labels(plc=key, ip=ip).set(float(plc_health[key]["recent_errors"][-1][0]))
+            except Exception:
+                pass
+            try:
+                if RECENT_ERROR_CODE_GAUGE is not None:
+                    code = normalize_error_code(plc_health[key]["recent_errors"][-1][1])
+                    RECENT_ERROR_CODE_GAUGE.labels(plc=key, ip=ip, code=code).set(1)
+            except Exception:
+                pass
+            # send textual message to Loki (best-effort)
+            try:
+                if LOKI_PUSH_URL:
+                    ts, msg = plc_health[key]["recent_errors"][-1]
+                    payload = {"streams": [{"stream": {"plc": key, "ip": ip}, "values": [[str(int(ts * 1e9)), msg]]}]}
+                    _send_to_loki(payload)
+            except Exception:
+                pass
+            fc = plc_health[key]["fail_count"]
+            delay = compute_backoff_delay(fc)
+            plc_health[key]["next_attempt"] = time.time() + delay
+            plc_health[key]["last_backoff"] = float(delay)
+            logger.info("Backoff for %s: fail_count=%d, delay=%.2fs, next_attempt=%s", key, fc, delay, plc_health[key]["next_attempt")

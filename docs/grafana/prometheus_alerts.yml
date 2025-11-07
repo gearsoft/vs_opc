@@ -1,0 +1,29 @@
+groups:
+  - name: vs_opc.rules
+    rules:
+      - alert: VSOPC_PLC_Failures
+        expr: sum by (plc) (vs_opc_plc_fail_count) > 0
+        for: 1m
+        labels:
+          severity: critical
+        annotations:
+          summary: "PLC failures detected for {{ $labels.plc }}"
+          description: "The gateway reports fail_count > 0 for PLC {{ $labels.plc }}. Investigate connectivity or PLC state."
+
+      - alert: VSOPC_High_Poll_Latency
+        expr: histogram_quantile(0.95, sum(rate(vs_opc_poll_latency_seconds_bucket[5m])) by (le)) > 2
+        for: 2m
+        labels:
+          severity: warning
+        annotations:
+          summary: "High poll latency (95th percentile)"
+          description: "Poll loop 95th percentile latency exceeded 2s over the last 5 minutes."
+
+      - alert: VSOPC_Reconnects_Storm
+        expr: increase(vs_opc_plc_reconnect_total[5m]) > 5
+        for: 2m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Frequent reconnects detected"
+          description: "More than 5 reconnects in 5 minutes detected; check network or PLC stability."

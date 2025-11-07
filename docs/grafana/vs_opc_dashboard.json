@@ -1,0 +1,181 @@
+{
+  "uid": "vs_opc_dashboard",
+  "title": "vs_opc PLC Gateway",
+  "tags": ["vs_opc", "plc", "gateway", "prometheus"],
+  "timezone": "browser",
+  "schemaVersion": 36,
+  "version": 1,
+  "refresh": "10s",
+  "panels": [
+    {
+      "id": 1,
+      "type": "stat",
+      "title": "PLC Fail Count",
+      "datasource": "Prometheus",
+      "targets": [
+        {
+          "expr": "sum(vs_opc_plc_fail_count{plc=~\\\"$plc\\\"}) by (plc)",
+          "legendFormat": "{{plc}}"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "none",
+          "min": 0,
+          "thresholds": { "mode": "absolute", "steps": [ { "color": "green", "value": null }, { "color": "red", "value": 1 } ] }
+        }
+      },
+      "options": { "reduceOptions": { "calcs": ["last"], "values": false } },
+      "gridPos": { "x": 0, "y": 0, "w": 6, "h": 5 }
+    },
+    {
+      "id": 2,
+      "type": "stat",
+      "title": "Last Backoff",
+      "datasource": "Prometheus",
+      "description": "Last backoff observed in seconds",
+      "targets": [
+        {
+          "expr": "max(vs_opc_plc_last_backoff_seconds{plc=~\\\"$plc\\\"}) by (plc)",
+          "legendFormat": "{{plc}}"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "s",
+          "min": 0,
+          "thresholds": { "mode": "absolute", "steps": [ { "color": "green", "value": null }, { "color": "orange", "value": 1 }, { "color": "red", "value": 10 } ] }
+        }
+      },
+      "options": { "reduceOptions": { "calcs": ["last"], "values": false } },
+      "gridPos": { "x": 6, "y": 0, "w": 6, "h": 5 }
+    },
+    {
+      "id": 3,
+      "type": "timeseries",
+      "title": "Reconnects (increases over 5m)",
+      "datasource": "Prometheus",
+      "targets": [
+        {
+          "expr": "increase(vs_opc_plc_reconnect_total{plc=~\\\"$plc\\\"}[5m])",
+          "legendFormat": "{{plc}}"
+        }
+      ],
+      "options": {
+        "legend": { "displayMode": "list", "placement": "bottom" },
+        "tooltip": { "mode": "all" }
+      },
+      "fieldConfig": { "defaults": { "unit": "short" } },
+      "gridPos": { "x": 0, "y": 5, "w": 12, "h": 7 }
+    },
+    {
+      "id": 4,
+      "type": "stat",
+      "title": "Connected",
+      "datasource": "Prometheus",
+      "targets": [
+        {
+          "expr": "avg(vs_opc_plc_connected{plc=~\\\"$plc\\\"}) by (plc)",
+          "legendFormat": "{{plc}}"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "none",
+          "mappings": [
+            { "type": "value", "options": { "0": { "text": "Disconnected" }, "1": { "text": "Connected" } } }
+          ],
+          "thresholds": { "mode": "absolute", "steps": [ { "color": "red", "value": 0 }, { "color": "green", "value": 1 } ] }
+        }
+      },
+      "options": { "reduceOptions": { "calcs": ["last"], "values": false } },
+      "gridPos": { "x": 12, "y": 5, "w": 8, "h": 7 }
+    },
+    {
+      "id": 5,
+      "type": "timeseries",
+      "title": "Poll Latency (95th percentile)",
+      "datasource": "Prometheus",
+      "targets": [
+        {
+          "expr": "histogram_quantile(0.95, sum(rate(vs_opc_poll_latency_seconds_bucket{plc=~\\\"$plc\\\"}[5m])) by (le, plc))",
+          "legendFormat": "{{plc}}"
+        }
+      ],
+      "fieldConfig": { "defaults": { "unit": "s" } },
+      "options": { "legend": { "displayMode": "list", "placement": "bottom" } },
+      "gridPos": { "x": 0, "y": 12, "w": 20, "h": 8 }
+    },
+    {
+      "id": 6,
+      "type": "table",
+      "title": "Per-IP / Per-PLC breakdown",
+      "datasource": "Prometheus",
+        "targets": [
+        {
+          "expr": "sum by (plc, ip) (vs_opc_plc_fail_count)",
+          "legendFormat": "fail_count"
+        },
+        {
+          "expr": "max by (plc, ip) (vs_opc_plc_last_backoff_seconds)",
+          "legendFormat": "last_backoff"
+        },
+        {
+          "expr": "avg by (plc, ip) (vs_opc_plc_connected)",
+          "legendFormat": "connected"
+        },
+        {
+          "expr": "sum by (plc, ip) (vs_opc_plc_recent_errors_count)",
+          "legendFormat": "recent_errors_count"
+        },
+        {
+          "expr": "max by (plc, ip) (vs_opc_plc_recent_error_timestamp_seconds)",
+          "legendFormat": "recent_error_last_ts"
+        }
+      ],
+      "options": { "showHeader": true },
+      "fieldConfig": { "defaults": { "mappings": [], "thresholds": { "mode": "absolute", "steps": [ { "color": "green", "value": null }, { "color": "red", "value": 1 } ] } } },
+      "gridPos": { "x": 0, "y": 20, "w": 20, "h": 8 }
+    },
+    {
+      "id": 7,
+      "type": "text",
+      "title": "Recent Errors (from /api/v1/hmi/health)",
+      "content": "<p>The gateway exposes detailed recent errors in the HTTP health endpoint. To display the 'recent_errors' array in Grafana, add the <strong>JSON API</strong> datasource plugin and configure a query to <code>http://&lt;gateway-host&gt;:PORT/api/v1/hmi/health</code>. Then create a table panel that maps the JSON path to a column named <code>recent_errors</code>.</p>\n<p>Example JSON API query path: <code>$.plcs[*].recent_errors</code></p>",
+      "gridPos": { "x": 0, "y": 28, "w": 20, "h": 4 }
+    }
+    ,
+    {
+      "id": 8,
+      "type": "logs",
+      "title": "Recent Error Logs (Loki)",
+      "datasource": "Loki",
+      "targets": [
+        {
+          "expr": "{plc=~\"$plc\"}",
+          "refId": "A"
+        }
+      ],
+      "options": {
+        "showLabels": true,
+        "wrapLogMessage": true
+      },
+      "gridPos": { "x": 0, "y": 32, "w": 20, "h": 8 }
+    }
+  ],
+  "templating": {
+    "list": [
+      {
+        "type": "query",
+        "name": "plc",
+        "label": "PLC",
+        "query": "label_values(vs_opc_plc_fail_count, plc)",
+        "datasource": "Prometheus",
+        "multi": true,
+        "includeAll": true
+      }
+    ]
+  },
+  "time": { "from": "now-1h", "to": "now" },
+  "timepicker": { "refresh_intervals": ["5s", "10s", "30s", "1m", "5m", "15m"] }
+}

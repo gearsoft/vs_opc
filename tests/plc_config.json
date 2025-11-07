@@ -1,0 +1,38 @@
+{
+  "plcs": [
+    {
+      "plc_id": "compactlogix",
+      "host": "192.168.32.201",
+      "type": "compactlogix",
+      "tags": [
+        {
+          "tag_id": "ABS1_Auto",
+          "name": "ABS1_Auto",
+          "address": "ABS01.HMI.AUTO.ST",
+          "data_type": "Boolean"
+        },
+        {
+          "tag_id": "ABS1_CFA_Actual",
+          "name": "ABS1_CFA_Actual",
+          "address": "ABS01.HMI.CFA.Actual",
+          "data_type": "Double"
+        }
+      ]
+    },
+    {
+      "plc_id": "slc500",
+      "host": "192.168.32.146",
+      "type": "slc500",
+      "tags": [
+        {
+          "tag_id": "M1_Batch_Weight",
+          "name": "M1_Batch_Weight",
+          "address": "N89:14",
+          "data_type": "Int32",
+          "scale_mul": 0.1,
+          "decimals": 2
+        }
+      ]
+    }
+  ]
+}
